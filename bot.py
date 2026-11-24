@@ -2,7 +2,7 @@
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Telegram solo recibe confirmaciones de órdenes ejecutadas correctamente.
-- Telegram permite controlar nuevas operaciones con /start, /stop y /status.
+- NO usa Telegram getUpdates.
 - Expone /health, /candles y /openapi.json para consultas externas.
 - /candles puede protegerse con CANDLES_API_KEY.
 """
@@ -37,11 +37,11 @@ COUNT = 200
 EXPIRATION = 5
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "12"))
+AMOUNT = float(os.getenv("AMOUNT", "18"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
-ENABLE_TRADES = os.getenv("ENABLE_TRADES", "false").lower() in (
+ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in (
     "1", "true", "yes", "si"
 )
 
@@ -82,135 +82,6 @@ NOTIFIED_ORDER_LOCK = threading.Lock()
 received_candles = []
 API_SERVER = None
 API_SERVER_LOCK = threading.Lock()
-
-# El control remoto solo acepta comandos del chat configurado en TELEGRAM_CHAT_ID.
-# Por seguridad, el bot arranca pausado salvo que ENABLE_TRADES=true esté definido.
-TRADING_ENABLED = threading.Event()
-if ENABLE_TRADES:
-    TRADING_ENABLED.set()
-TELEGRAM_COMMANDS_STARTED = False
-TELEGRAM_COMMANDS_LOCK = threading.Lock()
-
-
-def _telegram_send_text(text):
-    """Envía una respuesta de control al chat autorizado."""
-    if not TOKEN or not CHAT:
-        logging.warning("Telegram control no configurado: falta TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
-        return False
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT, "text": str(text)},
-            timeout=15,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("ok"):
-            logging.warning("Telegram no aceptó respuesta de control: %s", payload)
-            return False
-        return True
-    except requests.RequestException as exc:
-        logging.warning("No se pudo responder comando de Telegram: %s", exc)
-        return False
-
-
-def _telegram_command_worker():
-    """Lee /start, /stop y /status solo del chat autorizado."""
-    if not TOKEN or not CHAT:
-        logging.warning("Control Telegram desactivado: configura TELEGRAM_TOKEN y TELEGRAM_CHAT_ID")
-        return
-
-    offset = None
-    # Descarta comandos antiguos pendientes al arrancar para que un /start
-    # enviado antes del despliegue no active operaciones inesperadamente.
-    try:
-        initial = requests.get(
-            f"https://api.telegram.org/bot{TOKEN}/getUpdates",
-            params={"timeout": 0, "allowed_updates": json.dumps(["message"])},
-            timeout=10,
-        )
-        initial.raise_for_status()
-        initial_payload = initial.json()
-        if initial_payload.get("ok"):
-            old_updates = initial_payload.get("result", [])
-            if old_updates:
-                offset = max(int(item.get("update_id", 0)) for item in old_updates) + 1
-    except requests.RequestException as exc:
-        logging.warning("No se pudieron limpiar comandos antiguos de Telegram: %s", exc)
-    logging.info("TELEGRAM_CONTROL_LISTO | comandos: /start, /stop, /status")
-    while True:
-        try:
-            params = {"timeout": 25, "allowed_updates": json.dumps(["message"])}
-            if offset is not None:
-                params["offset"] = offset
-            response = requests.get(
-                f"https://api.telegram.org/bot{TOKEN}/getUpdates",
-                params=params,
-                timeout=35,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not payload.get("ok"):
-                logging.warning("Telegram getUpdates devolvió error: %s", payload)
-                time.sleep(3)
-                continue
-
-            for update in payload.get("result", []):
-                offset = int(update.get("update_id", 0)) + 1
-                message = update.get("message") or update.get("edited_message") or {}
-                chat = message.get("chat") or {}
-                sender_chat_id = str(chat.get("id", ""))
-                if sender_chat_id != str(CHAT):
-                    continue
-
-                raw_text = str(message.get("text", "")).strip()
-                if not raw_text:
-                    continue
-                command = raw_text.split()[0].split("@", 1)[0].lower()
-
-                if command == "/start":
-                    TRADING_ENABLED.set()
-                    logging.warning("CONTROL_TELEGRAM | bot ACTIVADO por chat autorizado")
-                    _telegram_send_text(
-                        "🟢 Bot ACTIVADO.\nSeguirá analizando y podrá ejecutar nuevas operaciones.\n"
-                        "Usa /stop para pausar o /status para consultar el estado."
-                    )
-                elif command == "/stop":
-                    TRADING_ENABLED.clear()
-                    logging.warning("CONTROL_TELEGRAM | bot PAUSADO por chat autorizado")
-                    _telegram_send_text(
-                        "🔴 Bot PAUSADO.\nNo se enviarán nuevas operaciones.\n"
-                        "Una operación que ya fue enviada al broker no se cancela con este comando.\n"
-                        "Usa /start para reanudar."
-                    )
-                elif command == "/status":
-                    state = "ACTIVADO 🟢" if TRADING_ENABLED.is_set() else "PAUSADO 🔴"
-                    _telegram_send_text(f"Estado del bot: {state}")
-                elif command in ("/help", "/ayuda"):
-                    _telegram_send_text("Comandos disponibles:\n/start - activar nuevas operaciones\n/stop - pausar nuevas operaciones\n/status - consultar estado")
-
-        except requests.RequestException as exc:
-            logging.warning("Telegram getUpdates no disponible: %s", exc)
-            time.sleep(5)
-        except Exception:
-            logging.exception("Error en el controlador de comandos Telegram")
-            time.sleep(3)
-
-
-def _ensure_telegram_commands():
-    global TELEGRAM_COMMANDS_STARTED
-    if TELEGRAM_COMMANDS_STARTED or not TOKEN or not CHAT:
-        return
-    with TELEGRAM_COMMANDS_LOCK:
-        if TELEGRAM_COMMANDS_STARTED:
-            return
-        thread = threading.Thread(
-            target=_telegram_command_worker,
-            name="telegram-commands",
-            daemon=True,
-        )
-        thread.start()
-        TELEGRAM_COMMANDS_STARTED = True
 
 
 def _telegram_worker():
@@ -1030,7 +901,6 @@ def main():
     start_candles_api()
     iq = connect_retry()
     _ensure_telegram_worker()
-    _ensure_telegram_commands()
 
     last_closed_stamp = {}
     last_order_candle = {}
@@ -1118,7 +988,7 @@ def main():
 
             # Escoge un único candidato global por minuto. La estrategia ya exige presión,
             # reversión cerrada, rechazo y ubicación antes de permitir una señal.
-            if candidates and broker_now is not None and TRADING_ENABLED.is_set():
+            if candidates and broker_now is not None:
                 minute_key = int(broker_now // 60)
                 if last_global_entry_minute != minute_key:
                     candidates.sort(key=lambda item: (item.get("score", 0), item.get("call_score", 0), item.get("put_score", 0)), reverse=True)
@@ -1133,9 +1003,6 @@ def main():
                         pair, original_signal, signal
                     )
                     with order_lock:
-                        if not TRADING_ENABLED.is_set():
-                            logging.info("ENTRADA_CANCELADA | bot pausado antes de enviar la orden")
-                            continue
                         # Reservar antes de la llamada para evitar reintentos duplicados
                         # si la respuesta de la API es lenta o ambigua.
                         last_order_candle[pair] = current_stamp
@@ -1195,6 +1062,7 @@ if __name__ == "__main__":
     while True:
         try:
             main()
+
         except KeyboardInterrupt:
             break
 
